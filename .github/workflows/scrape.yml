@@ -19,7 +19,7 @@ jobs:
           go-version: stable
 
       - name: Build
-        run: go build ./cmd/scraper -o scraper
+        run: go build -o scraper ./cmd/scraper
 
       - name: Run scraper
         run: ./scraper
