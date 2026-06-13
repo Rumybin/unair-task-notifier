@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -30,7 +31,8 @@ func SendNotification(ctx context.Context, botToken, chatID, message string) err
 	data.Set("text", message)
 	data.Set("parse_mode", "Markdown")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	body := strings.NewReader(data.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, body)
 	if err != nil {
 		return fmt.Errorf("notifier: create request: %w", err)
 	}
@@ -62,4 +64,3 @@ func FormatDeadlineChangedMessage(title, taskURL string) string {
 	return fmt.Sprintf("*⚠️ DEADLINE BERUBAH!*\n📝 %s\n🔗 %s",
 		title, taskURL)
 }
-

@@ -79,7 +79,7 @@ func main() {
 		if !t.DueDate.IsZero() {
 			dueStr = t.DueDate.Format("02 Jan 2006 15:04")
 		}
-		msg := notifier.FormatNewTaskMessage(t.CourseName, t.Title, dueStr, baseURL+t.TaskURL)
+		msg := notifier.FormatNewTaskMessage(t.CourseName, t.Title, dueStr, t.TaskURL)
 		log.Printf("Tugas baru: %s - %s", t.Title, t.CourseName)
 		if err := notifier.SendNotification(notifCtx, botToken, chatID, msg); err != nil {
 			log.Printf("Gagal kirim notif %s: %v", t.ID, err)
@@ -87,7 +87,7 @@ func main() {
 	}
 
 	for _, t := range changedDeadlines {
-		msg := notifier.FormatDeadlineChangedMessage(t.Title, baseURL+t.TaskURL)
+		msg := notifier.FormatDeadlineChangedMessage(t.Title, t.TaskURL)
 		log.Printf("Deadline berubah: %s", t.Title)
 		if err := notifier.SendNotification(notifCtx, botToken, chatID, msg); err != nil {
 			log.Printf("Gagal kirim notif deadline %s: %v", t.ID, err)
@@ -101,4 +101,3 @@ func main() {
 
 	log.Println("Selesai.")
 }
-
