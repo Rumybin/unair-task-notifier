@@ -9,13 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/html"
 	"github.com/Rumybin/unair-task-notifier/internal/diff"
+	"golang.org/x/net/html"
 )
 
 const (
-	scrapeTimeout = 30 * time.Second
-	maxBodySize   = 2 * 1024 * 1024
+	maxBodySize = 2 * 1024 * 1024
 )
 
 // FetchTasks mengambil daftar tugas dari halaman dashboard (/my/).
