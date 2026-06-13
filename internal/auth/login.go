@@ -17,9 +17,6 @@ const (
 	loginTimeout = 30 * time.Second
 )
 
-// Login melakukan autentikasi ke portal HEBAT Unair (Moodle).
-// Mengembalikan http.CookieJar yang berisi session cookie (MoodleSession)
-// jika login berhasil.
 func Login(ctx context.Context, baseURL, username, password string) (http.CookieJar, error) {
 	loginURL := baseURL + "/login/index.php"
 
@@ -30,6 +27,7 @@ func Login(ctx context.Context, baseURL, username, password string) (http.Cookie
 
 	client := &http.Client{
 		Jar: jar,
+		// Jangan follow redirect — kita handle manual
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -42,8 +40,14 @@ func Login(ctx context.Context, baseURL, username, password string) (http.Cookie
 	}
 
 	// Step 2: POST credentials
-	if err := postLogin(ctx, client, loginURL, username, password, token); err != nil {
+	redirectURL, err := postLogin(ctx, client, loginURL, username, password, token)
+	if err != nil {
 		return nil, fmt.Errorf("auth: post login: %w", err)
+	}
+
+	// Step 3: Follow redirect (ke /my/ atau ke testsession)
+	if err := followRedirect(ctx, client, redirectURL); err != nil {
+		return nil, fmt.Errorf("auth: follow redirect: %w", err)
 	}
 
 	// Verifikasi: MoodleSession cookie harus ada
@@ -63,18 +67,15 @@ func fetchLoginToken(ctx context.Context, client *http.Client, loginURL string) 
 	if err != nil {
 		return "", fmt.Errorf("create GET request: %w", err)
 	}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("GET %s: %w", loginURL, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GET %s returned status %d", loginURL, resp.StatusCode)
 	}
-
-	limited := io.LimitReader(resp.Body, 512*1024) // max 512KB
+	limited := io.LimitReader(resp.Body, 512*1024)
 	return extractLoginToken(limited)
 }
 
@@ -83,7 +84,6 @@ func extractLoginToken(r io.Reader) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse HTML: %w", err)
 	}
-
 	var token string
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
@@ -110,14 +110,14 @@ func extractLoginToken(r io.Reader) (string, error) {
 		}
 	}
 	walk(doc)
-
 	if token == "" {
 		return "", fmt.Errorf("logintoken not found in HTML")
 	}
 	return token, nil
 }
 
-func postLogin(ctx context.Context, client *http.Client, loginURL, username, password, token string) error {
+// postLogin mengirim kredensial. Mengembalikan URL redirect dari response.
+func postLogin(ctx context.Context, client *http.Client, loginURL, username, password, token string) (string, error) {
 	form := url.Values{}
 	form.Set("username", username)
 	form.Set("password", password)
@@ -125,41 +125,68 @@ func postLogin(ctx context.Context, client *http.Client, loginURL, username, pas
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return fmt.Errorf("create POST request: %w", err)
+		return "", fmt.Errorf("create POST request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s: %w", loginURL, err)
+		return "", fmt.Errorf("POST %s: %w", loginURL, err)
 	}
 	defer resp.Body.Close()
 
-	// Moodle merespon dengan redirect 303 ke /my/ jika sukses
+	// Moodle merespon dengan redirect (303) jika sukses
 	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("login failed (status %d): %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("login failed (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	location := resp.Header.Get("Location")
-	if !strings.Contains(location, "/my/") {
-		return fmt.Errorf("unexpected redirect target: %s", location)
+	if location == "" {
+		return "", fmt.Errorf("no Location header in redirect response")
 	}
 
+	return location, nil
+}
+
+// followRedirect mengikuti URL redirect dengan GET untuk menyelesaikan login session.
+func followRedirect(ctx context.Context, client *http.Client, redirectURL string) error {
+	// Handle relative URL
+	if strings.HasPrefix(redirectURL, "/") {
+		redirectURL = "https://hebat.elearning.unair.ac.id" + redirectURL
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, redirectURL, nil)
+	if err != nil {
+		return fmt.Errorf("create GET request to %s: %w", redirectURL, err)
+	}
+
+	// Izinkan follow redirect untuk mengikuti rantai (testsession -> /my/)
+	followClient := &http.Client{
+		Jar: client.Jar,
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := followClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", redirectURL, err)
+	}
+	defer resp.Body.Close()
+
+	// Tidak perlu cek status code — yang penting cookie sudah disimpan di Jar
+	_ = resp
 	return nil
 }
 
-
-// NewHTTPClient membuat http.Client dengan CookieJar yang sudah berisi session.
-// Gunakan client ini untuk request selanjutnya (scraping, dll).
 func NewHTTPClient(jar http.CookieJar) *http.Client {
 	return &http.Client{
 		Jar: jar,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
+			if len(via) >= 5 {
 				return fmt.Errorf("auth: too many redirects")
 			}
 			return nil
 		},
 	}
 }
+
