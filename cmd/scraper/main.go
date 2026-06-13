@@ -27,11 +27,11 @@ func main() {
 	username := os.Getenv("UNAIR_USERNAME")
 	password := os.Getenv("UNAIR_PASSWORD")
 	dsn := os.Getenv("MARIADB_DSN")
-	phone := os.Getenv("CALLMEBOT_PHONE")
-	apikey := os.Getenv("CALLMEBOT_APIKEY")
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
 
-	if username == "" || password == "" || dsn == "" || phone == "" || apikey == "" {
-		log.Fatalf("semua env var wajib diisi")
+	if username == "" || password == "" || dsn == "" || botToken == "" || chatID == "" {
+		log.Fatalf("semua env var wajib diisi: UNAIR_USERNAME, UNAIR_PASSWORD, MARIADB_DSN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 	}
 
 	log.Println("Menghubungkan ke MariaDB...")
@@ -81,7 +81,7 @@ func main() {
 		}
 		msg := notifier.FormatNewTaskMessage(t.CourseName, t.Title, dueStr, baseURL+t.TaskURL)
 		log.Printf("Tugas baru: %s - %s", t.Title, t.CourseName)
-		if err := notifier.SendNotification(notifCtx, phone, apikey, msg); err != nil {
+		if err := notifier.SendNotification(notifCtx, botToken, chatID, msg); err != nil {
 			log.Printf("Gagal kirim notif %s: %v", t.ID, err)
 		}
 	}
@@ -89,7 +89,7 @@ func main() {
 	for _, t := range changedDeadlines {
 		msg := notifier.FormatDeadlineChangedMessage(t.Title, baseURL+t.TaskURL)
 		log.Printf("Deadline berubah: %s", t.Title)
-		if err := notifier.SendNotification(notifCtx, phone, apikey, msg); err != nil {
+		if err := notifier.SendNotification(notifCtx, botToken, chatID, msg); err != nil {
 			log.Printf("Gagal kirim notif deadline %s: %v", t.ID, err)
 		}
 	}
