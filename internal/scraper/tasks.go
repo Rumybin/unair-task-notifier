@@ -1,10 +1,9 @@
-﻿package scraper
+package scraper
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,9 +15,14 @@ import (
 
 const (
 	scrapeTimeout = 30 * time.Second
-	maxBodySize  = 2 * 1024 * 1024
+	maxBodySize   = 2 * 1024 * 1024
 )
 
+// FetchTasks mengambil daftar tugas dari halaman dashboard (/my/).
+// Karena block Timeline di Moodle 4.x di-render oleh JavaScript,
+// kita ambil data dari block Calendar yang sudah statis di HTML
+// (tabel #month-detailed dengan event-item di dalam td.day).
+// Course name diambil dari Recently accessed items jika tersedia.
 func FetchTasks(ctx context.Context, client *http.Client, baseURL string) ([]diff.Task, error) {
 	dashURL := baseURL + "/my/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dashURL, nil)
@@ -34,46 +38,76 @@ func FetchTasks(ctx context.Context, client *http.Client, baseURL string) ([]dif
 		return nil, fmt.Errorf("scraper: %s returned status %d", dashURL, resp.StatusCode)
 	}
 	limited := io.LimitReader(resp.Body, maxBodySize)
-	return parseTasksPage(limited)
+	return parseDashboardPage(limited)
 }
 
-func parseTasksPage(r io.Reader) ([]diff.Task, error) {
+// parseDashboardPage mengekstrak tugas dari block Calendar dan Recently accessed items.
+func parseDashboardPage(r io.Reader) ([]diff.Task, error) {
 	doc, err := html.Parse(r)
 	if err != nil {
 		return nil, fmt.Errorf("scraper: parse HTML: %w", err)
 	}
+
+	// Ambil mapping URL -> courseName dari Recently accessed items
+	courseNameMap := extractCourseNamesFromRecentItems(doc)
+
+	// Parse event dari Calendar table
+	events := parseCalendarTable(doc)
+
+	// Gabungkan
 	var tasks []diff.Task
-	var currentTimestamp int64
+	for _, e := range events {
+		task := diff.Task{
+			ID:      e.eventID,
+			Title:   e.title,
+			TaskURL: e.url,
+			DueDate: time.Unix(e.timestamp, 0).UTC(),
+		}
+		if cn, ok := findCourseNameForURL(e.url, courseNameMap); ok {
+			task.CourseName = cn
+		}
+		tasks = append(tasks, task)
+	}
+
+	return tasks, nil
+}
+
+// calendarEvent mewakili satu event dari tabel calendar.
+type calendarEvent struct {
+	eventID   string
+	title     string
+	url       string
+	timestamp int64
+}
+
+// parseCalendarTable mengekstrak event dari <table id="month-detailed-...">
+// dengan mencari td.day yang memiliki data-day-timestamp, lalu
+// mengambil li[data-region="event-item"] di dalamnya.
+func parseCalendarTable(doc *html.Node) []calendarEvent {
+	var events []calendarEvent
+
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode {
-			if n.Data == "div" {
-				var region string
-				for _, attr := range n.Attr {
-					if attr.Key == "data-region" {
-						region = attr.Val
-					}
-					if attr.Key == "data-timestamp" && region == "event-list-content-date" {
-						ts, err := strconv.ParseInt(attr.Val, 10, 64)
-						if err == nil {
-							currentTimestamp = ts
+		if n.Type == html.ElementNode && n.Data == "td" {
+			var isDay bool
+			var dayTimestamp int64
+			for _, attr := range n.Attr {
+				if attr.Key == "class" {
+					for _, cls := range strings.Fields(attr.Val) {
+						if cls == "day" {
+							isDay = true
 						}
 					}
 				}
+				if attr.Key == "data-day-timestamp" {
+					ts, err := strconv.ParseInt(attr.Val, 10, 64)
+					if err == nil {
+						dayTimestamp = ts
+					}
+				}
 			}
-			if n.Data == "div" {
-				var isEventItem bool
-				for _, attr := range n.Attr {
-					if attr.Key == "data-region" && attr.Val == "event-list-item" {
-						isEventItem = true
-					}
-				}
-				if isEventItem {
-					task, ok := parseTaskItem(n, currentTimestamp)
-					if ok {
-						tasks = append(tasks, task)
-					}
-				}
+			if isDay && dayTimestamp > 0 {
+				events = append(events, extractEventsFromDayCell(n, dayTimestamp)...)
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -81,130 +115,153 @@ func parseTasksPage(r io.Reader) ([]diff.Task, error) {
 		}
 	}
 	walk(doc)
-	return tasks, nil
+
+	return events
 }
 
-func parseTaskItem(n *html.Node, ts int64) (diff.Task, bool) {
-	var task diff.Task
-	if ts > 0 {
-		task.DueDate = time.Unix(ts, 0).UTC()
-	}
-	var eventNode *html.Node
-	var searchAnchor func(*html.Node)
-	searchAnchor = func(node *html.Node) {
-		if eventNode != nil {
-			return
-		}
-		if node.Type == html.ElementNode && node.Data == "a" {
-			for _, attr := range node.Attr {
-				if attr.Key == "data-action" && attr.Val == "view-event" {
-					eventNode = node
-					return
+// extractEventsFromDayCell mengambil li[data-region="event-item"] dari td.day.
+func extractEventsFromDayCell(td *html.Node, dayTimestamp int64) []calendarEvent {
+	var events []calendarEvent
+
+	var findEvents func(*html.Node)
+	findEvents = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "li" {
+			var isEvent bool
+			for _, attr := range n.Attr {
+				if attr.Key == "data-region" && attr.Val == "event-item" {
+					isEvent = true
 				}
 			}
-		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			searchAnchor(c)
-		}
-	}
-	searchAnchor(n)
-	if eventNode == nil {
-		log.Printf("scraper: warning: skip item, no a[data-action=view-event]")
-		return task, false
-	}
-	for _, attr := range eventNode.Attr {
-		switch attr.Key {
-		case "data-event-id":
-			task.ID = attr.Val
-		case "href":
-			task.TaskURL = attr.Val
-		case "title":
-			task.Title = strings.TrimSuffix(attr.Val, " is due")
-		}
-	}
-	if task.ID == "" {
-		log.Printf("scraper: warning: skip item, no data-event-id")
-		return task, false
-	}
-	// Cari small.text-end.text-nowrap untuk jam
-	var searchTime func(*html.Node)
-	searchTime = func(node *html.Node) {
-		if node.Type == html.ElementNode && node.Data == "small" {
-			var classes []string
-			for _, attr := range node.Attr {
-				if attr.Key == "class" {
-					classes = strings.Fields(attr.Val)
-				}
-			}
-			hasTextEnd := false
-			hasTextNowrap := false
-			for _, cls := range classes {
-				if cls == "text-end" {
-					hasTextEnd = true
-				}
-				if cls == "text-nowrap" {
-					hasTextNowrap = true
-				}
-			}
-			if hasTextEnd && hasTextNowrap && node.FirstChild != nil {
-				timeStr := strings.TrimSpace(node.FirstChild.Data)
-				parts := strings.Split(timeStr, ":")
-				if len(parts) == 2 {
-					h, err1 := strconv.Atoi(parts[0])
-					m, err2 := strconv.Atoi(parts[1])
-					if err1 == nil && err2 == nil && h >= 0 && h < 24 && m >= 0 && m < 60 {
-						task.DueDate = time.Date(
-							task.DueDate.Year(), task.DueDate.Month(), task.DueDate.Day(),
-							h, m, 0, 0, time.UTC,
-						)
+			if isEvent {
+				event := calendarEvent{timestamp: dayTimestamp}
+				var findAnchor func(*html.Node)
+				findAnchor = func(anchorNode *html.Node) {
+					if event.eventID != "" {
+						return
+					}
+					if anchorNode.Type == html.ElementNode && anchorNode.Data == "a" {
+						var hasAction bool
+						for _, attr := range anchorNode.Attr {
+							if attr.Key == "data-action" && attr.Val == "view-event" {
+								hasAction = true
+							}
+							if attr.Key == "data-event-id" {
+								event.eventID = attr.Val
+							}
+							if attr.Key == "href" {
+								event.url = attr.Val
+							}
+							if attr.Key == "title" {
+								event.title = strings.TrimSuffix(attr.Val, " is due")
+							}
+						}
+						if hasAction {
+							return
+						}
+					}
+					for c := anchorNode.FirstChild; c != nil; c = c.NextSibling {
+						findAnchor(c)
 					}
 				}
-			}
-		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			searchTime(c)
-		}
-	}
-	searchTime(n)
-	// Cari div.event-name-container > small.mb-0
-	var searchCourse func(*html.Node)
-	searchCourse = func(node *html.Node) {
-		if task.CourseName != "" {
-			return
-		}
-		if node.Type == html.ElementNode && node.Data == "div" {
-			var classes []string
-			for _, attr := range node.Attr {
-				if attr.Key == "class" {
-					classes = strings.Fields(attr.Val)
+				findAnchor(n)
+				if event.eventID != "" {
+					events = append(events, event)
 				}
 			}
-			for _, cls := range classes {
-				if cls == "event-name-container" {
-					for c := node.FirstChild; c != nil; c = c.NextSibling {
-						if c.Type == html.ElementNode && c.Data == "small" {
-							var smallClasses []string
-							for _, a := range c.Attr {
-								if a.Key == "class" {
-									smallClasses = strings.Fields(a.Val)
-								}
-							}
-							for _, sc := range smallClasses {
-								if sc == "mb-0" && c.FirstChild != nil {
-									task.CourseName = strings.TrimSpace(c.FirstChild.Data)
-									return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			findEvents(c)
+		}
+	}
+	findEvents(td)
+
+	return events
+}
+
+// extractCourseNamesFromRecentItems mengambil mapping course name
+// dari block Recently accessed items yang statis di HTML.
+func extractCourseNamesFromRecentItems(doc *html.Node) map[string]string {
+	names := make(map[string]string)
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "div" {
+			var hasRegion bool
+			for _, attr := range n.Attr {
+				if attr.Key == "data-region" && attr.Val == "recentlyaccesseditems-view-content" {
+					hasRegion = true
+				}
+			}
+			if hasRegion {
+				var parseItems func(*html.Node)
+				parseItems = func(node *html.Node) {
+					if node.Type == html.ElementNode && node.Data == "div" {
+						var isCard bool
+						for _, attr := range node.Attr {
+							if attr.Key == "class" {
+								for _, cls := range strings.Fields(attr.Val) {
+									if cls == "card" {
+										isCard = true
+									}
 								}
 							}
 						}
+						if isCard {
+							extractRecentItem(node, names)
+						}
 					}
+					for c := node.FirstChild; c != nil; c = c.NextSibling {
+						parseItems(c)
+					}
+				}
+				parseItems(n)
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	return names
+}
+
+// extractRecentItem mengekstrak URL dan course name dari satu item
+// di Recently accessed items.
+func extractRecentItem(cardNode *html.Node, names map[string]string) {
+	var itemURL string
+	var courseName string
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" && itemURL == "" {
+					itemURL = attr.Val
 				}
 			}
 		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			searchCourse(c)
+		if n.Type == html.TextNode && strings.TrimSpace(n.Data) != "" {
+			text := strings.TrimSpace(n.Data)
+			if courseName == "" && strings.Contains(text, " - ") {
+				courseName = text
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
 		}
 	}
-	searchCourse(n)
-	return task, true
+	walk(cardNode)
+
+	if itemURL != "" && courseName != "" {
+		names[itemURL] = courseName
+	}
 }
 
+// findCourseNameForURL mencoba mencari course_name untuk URL tugas.
+func findCourseNameForURL(taskURL string, courseNameMap map[string]string) (string, bool) {
+	if cn, ok := courseNameMap[taskURL]; ok {
+		return cn, true
+	}
+	return "", false
+}
