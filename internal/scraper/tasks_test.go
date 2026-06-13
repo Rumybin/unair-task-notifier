@@ -65,3 +65,36 @@ func TestParseDashboardPage_ReturnsEmpty_OnEmptyHTML(t *testing.T) {
 		t.Errorf("expected 0 tasks, got %d", len(tasks))
 	}
 }
+
+func TestParseCourseNameFromDetailPage_ReturnsCourseNameFromBreadcrumb(t *testing.T) {
+	f, err := os.Open("../../testdata/sample_detail_page.html")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	courseName, err := parseCourseNameFromDetailPage(f)
+	if err != nil {
+		t.Fatalf("parseCourseNameFromDetailPage: %v", err)
+	}
+
+	expected := "2025Genap - FST25605008 - Fungsi dan Proses Bisnis (Praktikum) - S1 - Sistem Informasi - 2025 - I3"
+	if courseName != expected {
+		t.Errorf("courseName = %q, want %q", courseName, expected)
+	}
+}
+
+func TestParseCourseNameFromDetailPage_ReturnsError_OnEmptyHTML(t *testing.T) {
+	_, err := parseCourseNameFromDetailPage(strings.NewReader("<html></html>"))
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
+}
+
+func TestParseCourseNameFromDetailPage_ReturnsError_WhenNoBreadcrumb(t *testing.T) {
+	html := "<html><body><div>no breadcrumb here</div></body></html>"
+	_, err := parseCourseNameFromDetailPage(strings.NewReader(html))
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
+}

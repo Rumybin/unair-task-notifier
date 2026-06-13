@@ -15,13 +15,16 @@ import (
 
 const (
 	maxBodySize = 2 * 1024 * 1024
+	// fetchCourseNameTimeout per detail page
+	fetchCourseNameTimeout = 15 * time.Second
 )
 
 // FetchTasks mengambil daftar tugas dari halaman dashboard (/my/).
 // Karena block Timeline di Moodle 4.x di-render oleh JavaScript,
 // kita ambil data dari block Calendar yang sudah statis di HTML
 // (tabel #month-detailed dengan event-item di dalam td.day).
-// Course name diambil dari Recently accessed items jika tersedia.
+// Course name diambil dari halaman detail assignment jika tidak ditemukan
+// di Recently accessed items.
 func FetchTasks(ctx context.Context, client *http.Client, baseURL string) ([]diff.Task, error) {
 	dashURL := baseURL + "/my/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dashURL, nil)
@@ -37,7 +40,120 @@ func FetchTasks(ctx context.Context, client *http.Client, baseURL string) ([]dif
 		return nil, fmt.Errorf("scraper: %s returned status %d", dashURL, resp.StatusCode)
 	}
 	limited := io.LimitReader(resp.Body, maxBodySize)
-	return parseDashboardPage(limited)
+	tasks, err := parseDashboardPage(limited)
+	if err != nil {
+		return nil, err
+	}
+
+	// Isi course name yang masih kosong dengan scrape halaman detail
+	for i, t := range tasks {
+		if t.CourseName != "" {
+			continue
+		}
+		if t.TaskURL == "" {
+			continue
+		}
+		// Gunakan context independen per detail page (timeout pendek)
+		detailCtx, cancel := context.WithTimeout(ctx, fetchCourseNameTimeout)
+		cn, err := FetchCourseName(detailCtx, client, t.TaskURL)
+		cancel()
+		if err != nil {
+			// Tidak fatal — log saja; course name tetap kosong
+			continue
+		}
+		tasks[i].CourseName = cn
+	}
+
+	return tasks, nil
+}
+
+// FetchCourseName mengambil nama course dari halaman detail assignment
+// via elemen breadcrumb (ol.breadcrumb > li.breadcrumb-item pertama > a).
+func FetchCourseName(ctx context.Context, client *http.Client, taskURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, taskURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("scraper: create detail request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("scraper: GET %s: %w", taskURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("scraper: detail page returned status %d", resp.StatusCode)
+	}
+	limited := io.LimitReader(resp.Body, maxBodySize)
+	return parseCourseNameFromDetailPage(limited)
+}
+
+// parseCourseNameFromDetailPage mengekstrak course name dari breadcrumb
+// di halaman detail assignment.
+// Struktur: ol.breadcrumb > li.breadcrumb-item (pertama) > a (title attribute).
+func parseCourseNameFromDetailPage(r io.Reader) (string, error) {
+	doc, err := html.Parse(r)
+	if err != nil {
+		return "", fmt.Errorf("scraper: parse detail HTML: %w", err)
+	}
+
+	var courseName string
+	var findBreadcrumb func(*html.Node)
+	findBreadcrumb = func(n *html.Node) {
+		if courseName != "" {
+			return
+		}
+		if n.Type == html.ElementNode && n.Data == "ol" {
+			var isBreadcrumb bool
+			for _, attr := range n.Attr {
+				if attr.Key == "class" {
+					for _, cls := range strings.Fields(attr.Val) {
+						if cls == "breadcrumb" {
+							isBreadcrumb = true
+						}
+					}
+				}
+			}
+			if isBreadcrumb {
+				// Ambil li.breadcrumb-item pertama
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					if c.Type == html.ElementNode && c.Data == "li" {
+						for _, attr := range c.Attr {
+							if attr.Key == "class" && strings.Contains(attr.Val, "breadcrumb-item") {
+								// Cari <a> dengan title attribute di dalam li pertama
+								var findAnchor func(*html.Node)
+								findAnchor = func(anchorNode *html.Node) {
+									if courseName != "" {
+										return
+									}
+									if anchorNode.Type == html.ElementNode && anchorNode.Data == "a" {
+										for _, attr := range anchorNode.Attr {
+											if attr.Key == "title" && attr.Val != "" {
+												courseName = attr.Val
+												return
+											}
+										}
+									}
+									for ch := anchorNode.FirstChild; ch != nil; ch = ch.NextSibling {
+										findAnchor(ch)
+									}
+								}
+								findAnchor(c)
+								return // hanya li pertama
+							}
+						}
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			findBreadcrumb(c)
+		}
+	}
+	findBreadcrumb(doc)
+
+	if courseName == "" {
+		return "", fmt.Errorf("scraper: course name not found in breadcrumb")
+	}
+	return courseName, nil
 }
 
 // parseDashboardPage mengekstrak tugas dari block Calendar dan Recently accessed items.
